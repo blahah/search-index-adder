@@ -1,11 +1,22 @@
-var _ = require('lodash')
-var da = require('distribute-array')
-var sia = require('../')
-var sis = require('search-index-searcher')
+var JSONStream = require('JSONStream')
+var Readable = require('stream').Readable
+var SearchIndexAdder = require('../')
+var SearchIndexSearcher = require('search-index-searcher')
+var fs = require('fs')
 var test = require('tape')
-var async = require('async')
 
-var resultForStarUSA = [ '510', '287', '998', '997', '996', '995', '994', '993', '992', '991' ]
+var resultsForStarUSA = [
+  '998',
+  '997',
+  '996',
+  '995',
+  '994',
+  '993',
+  '992',
+  '991',
+  '510',
+  '287'
+]
 
 test('set seperator at field level', function (t) {
   t.plan(5)
@@ -18,142 +29,112 @@ test('set seperator at field level', function (t) {
     title: 'this is a title',
     body: 'horse zebra elephant'
   }]
-  sia({
+  const s = new Readable({ objectMode: true })
+  batch.forEach(function (elem) {
+    s.push(elem)
+  })
+  s.push(null)
+  SearchIndexAdder({
     indexPath: 'test/sandbox/separatorTest'
   }, function (err, indexer) {
     t.error(err)
-    indexer.add(batch, {
-      fieldOptions: [
-        {
-          fieldName: 'body',
-          separator: 'x'
-        }
-      ]
-    }, function (err) {
-      t.error(err)
-      sis(indexer.options, function (err, searcher) {
-        t.error(err)
-        var q = {}
-        q.query = {
-          AND: {'*': ['zebra']}
-        }
-        searcher.search(q, function (err, searchResults) {
+    s.pipe(indexer.defaultPipeline())
+      .on('data', function (data) {
+        t.looseEqual(
+          Object.keys(data),
+          [ 'normalised', 'options', 'raw', 'stored', 'tokenised', 'vector', 'id' ])
+      })
+      .pipe(indexer.add())
+      .on('data', function (data) {})
+      .on('end', function () {
+        indexer.close(function (err) {
           t.error(err)
-          t.equal(searchResults.hits[0].id, '1')
+          SearchIndexSearcher(indexer.options, function (err, searcher) {
+            t.error(err)
+            var q = {}
+            q.query = [{
+              AND: {'*': ['zebra']}
+            }]
+            searcher.search(q)
+              .on('data', function (data) {
+                t.ok(data.document.id === '1')
+              })
+          })
         })
       })
-    })
-  })
-})
-
-test('simple indexing test - debugging 510', function (t) {
-  t.plan(10)
-  var batch = _.filter(require('../node_modules/reuters-21578-json/data/full/reuters-000.json'), { 'id': '510' })
-  t.equal(batch.length, 1)
-  sia({indexPath: 'test/sandbox/simpleIndexing510'}, function (err, indexer) {
-    t.error(err)
-    sis(indexer.options, function (err, searcher) {
-      t.error(err)
-      indexer.add(batch, {}, function (err) {
-        t.error(err)
-        var q = {}
-        q.query = {
-          AND: {'*': ['usa']}
-        }
-        searcher.search(q, function (err, searchResults) {
-          t.error(err)
-          t.equal(searchResults.hits[0].tfidf[0][0][0], 'usa')
-          t.equal(searchResults.hits[0].tfidf[0][0][1], '*')
-          t.equal(searchResults.hits[0].tfidf[0][0][2], 0.545144315135374)
-          t.equal(searchResults.hits[0].tfidf[0][0][3], 1.8109302162163288)
-          t.equal(searchResults.hits[0].tfidf[0][0][4], 0.3010299956639812)
-        })
-      })
-    })
   })
 })
 
 test('simple indexing test', function (t) {
-  var batch = require('../node_modules/reuters-21578-json/data/full/reuters-000.json')
-  t.plan(6)
-  t.equal(batch.length, 1000)
-  sia({indexPath: 'test/sandbox/simpleIndexing'}, function (err, indexer) {
+  t.plan(5)
+  var j = 0
+  var k = 0
+  SearchIndexAdder({
+    indexPath: 'test/sandbox/simpleIndexing'
+  }, function (err, indexer) {
     t.error(err)
-    sis(indexer.options, function (err, searcher) {
-      t.error(err)
-      indexer.add(batch, {}, function (err) {
-        t.error(err)
-        var q = {}
-        q.query = {
-          AND: {'*': ['usa']}
-        }
-        searcher.search(q, function (err, searchResults) {
+    fs.createReadStream('./node_modules/reuters-21578-json/data/fullFileStream/000.str')
+      .pipe(JSONStream.parse())
+      .on('data', function (data) {
+        j++
+      })
+      .pipe(indexer.defaultPipeline())
+      .on('data', function (data) {
+        k++
+      })
+      .pipe(indexer.add())
+      .on('data', function (data) {})
+      .on('end', function () {
+        indexer.close(function (err) {
           t.error(err)
-          t.deepLooseEqual(_.map(searchResults.hits, 'id').slice(0, 10), resultForStarUSA)
+          t.equals(j, 1000)
+          t.equals(k, 1000)
+          SearchIndexSearcher(indexer.options, function (err, searcher) {
+            t.error(err)
+            var q = {}
+            q.query = {
+              AND: {'*': ['usa']}
+            }
+            q.pageSize = 10
+            var i = 0
+            searcher.search(q).on('data', function (data) {
+              console.log(data.document.id)
+              t.equals(resultsForStarUSA[i++], data.document.id)
+            })
+          })
         })
       })
-    })
   })
 })
 
-test('concurrancy test', function (t) {
-  var startTime = Date.now()
-  t.plan(19)
-  sia({indexPath: 'test/sandbox/concurrentIndexing'}, function (err, indexer) {
-    t.error(err)
-    sis(indexer.options, function (err, searcher) {
-      t.error(err)
-      var batchData = da(require('../node_modules/reuters-21578-json/data/full/reuters-000.json'), 10)
-      t.equal(batchData.length, 10)
-      async.each(batchData, function (batch, callback) {
-        console.log('task submitted')
-        indexer.add(batch, {}, function (err) {
-          if (!err) t.pass('no errorness')
-          callback()
-        })
-      }, function (err) {
-        t.error(err)
-        var q = {}
-        q.query = {
-          AND: {'*': ['usa']}
-        }
-        searcher.search(q, function (err, searchResults) {
-          if (!err) t.pass('no errorness')
-          t.deepLooseEqual(_.map(searchResults.hits, 'id').slice(0, 10), resultForStarUSA)
-        })
-        indexer.options.indexes.get('LAST-UPDATE-TIMESTAMP', function (err, val) {
-          t.error(err)
-          t.ok((val - startTime) > 0,
-            'lastUpdateTimestamp seems reasonable (' + (val - startTime) + ')')
-          t.ok((val - startTime) < 60000,
-            'lastUpdateTimestamp seems reasonable (' + (val - startTime) + ')')
-        })
-      })
-    })
-  })
-})
+// TODO: make this work again
 
 test('preserve array fields in stored document', function (t) {
-    t.plan(6)
-    sia({indexPath: 'test/sandbox/preserveArrayFields'}, function (err, indexer) {
-        t.error(err)
-        sis(indexer.options, function (err, searcher) {
-            t.error(err)
-            indexer.add([{'id': '1', 'anArray': ['one', 'two', 'three']}], function (err) {
-                var q = {};
-                if (!err) t.pass('no errors')
-
-                q.query = {
-                    AND: {'*': ['one']}
-                }
-
-                searcher.search(q, function (err, searchResults) {
-                    if (!err) t.pass('no errors')
-
-                    t.equal(searchResults.hits.length, 1)
-                    t.deepEqual(searchResults.hits[0].document, {'id': '1', 'anArray': ['one', 'two', 'three']})
-                })
+  t.plan(5)
+  SearchIndexAdder({indexPath: 'test/sandbox/preserveArrayFields'}, function (err, indexer) {
+    t.error(err)
+    SearchIndexSearcher(indexer.options, function (err, searcher) {
+      t.error(err)
+      const s = new Readable({ objectMode: true })
+      s.push({'id': '1', 'anArray': ['one', 'two', 'three']})
+      s.push(null)
+      s.pipe(indexer.defaultPipeline())
+        .pipe(indexer.add())
+        .on('data', function (data) {})
+        .on('end', function () {
+          var q = {}
+          q.query = {
+            AND: {'*': ['one']}
+          }
+          searcher.search(q)
+            .on('data', function (data) {
+              t.equals(data.document.id, '1')
+              t.looseEquals(data.document.anArray, ['one', 'two', 'three'])
+            })
+            .on('end', function () {
+              t.ok(true)
             })
         })
     })
+  })
 })
